@@ -40,6 +40,17 @@ def _as_float(body: dict, key: str, default: float) -> float:
         raise RailError(f"参数 {key!r} 必须是数值", component="console") from error
 
 
+def _optional_float(body: dict, key: str) -> float | None:
+    """取出可选浮点字段。"""
+
+    if body.get(key) is None:
+        return None
+    try:
+        return float(body[key])
+    except (TypeError, ValueError) as error:
+        raise RailError(f"参数 {key!r} 必须是数值", component="console") from error
+
+
 class Api:
     """把 HTTP 请求翻译成平台调用。"""
 
@@ -67,6 +78,10 @@ class Api:
         add("GET", "/api/interlock", lambda params, body: self._platform.status()["interlock"])
         add("GET", "/api/gaps", lambda params, body: self._platform.status()["gaps"])
         add("GET", "/api/quota", lambda params, body: self._platform.status()["quota"])
+        add("GET", "/api/punctuality", self._punctuality)
+        add("GET", "/api/punctuality/runs/{runID}", self._punctuality_run)
+        add("GET", "/api/punctuality/stations/{stationID}", self._punctuality_station)
+        add("GET", "/api/punctuality/replay/{seq}", self._punctuality_replay)
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/trend", self._trend)
@@ -90,6 +105,9 @@ class Api:
         add("POST", "/api/sweep", self._sweep)
         add("POST", "/api/dwell", self._dwell)
         add("POST", "/api/route", self._route)
+        add("POST", "/api/punctuality/plans", self._punctuality_plan)
+        add("POST", "/api/punctuality/arrivals", self._punctuality_arrival)
+        add("POST", "/api/punctuality/departures", self._punctuality_departure)
         add("POST", "/api/reset-state", self._reset_state)
 
     def routes(self) -> list[dict]:
@@ -260,6 +278,59 @@ class Api:
             _require(body, "origin"),
             _require(body, "destination"),
             _as_int(body, "distance_m", 0),
+        )
+
+    def _punctuality(self, params: dict, body: dict) -> dict:
+        return self._platform.punctuality_status(str(params.get("service_date", "")))
+
+    def _punctuality_run(self, params: dict, body: dict) -> dict:
+        return self._platform.punctuality_run_view(str(params.get("runID", "")))
+
+    def _punctuality_station(self, params: dict, body: dict) -> dict:
+        return self._platform.punctuality_station_view(
+            str(params.get("stationID", "")), str(params.get("service_date", ""))
+        )
+
+    def _punctuality_replay(self, params: dict, body: dict) -> dict:
+        return self._platform.replay_punctuality(
+            _as_int(params, "seq", 0), str(params.get("service_date", ""))
+        )
+
+    def _punctuality_plan(self, params: dict, body: dict) -> dict:
+        calls = body.get("calls")
+        if not isinstance(calls, list) or not calls:
+            raise RailError("calls 必须是非空数组", component="console")
+        normalized = []
+        for call in calls:
+            if not isinstance(call, dict):
+                raise RailError("每个计划停站必须是对象", component="console")
+            normalized.append(
+                {
+                    "station_id": _require(call, "station_id"),
+                    "arrival_at": _as_float(call, "arrival_at", 0.0),
+                    "departure_at": _as_float(call, "departure_at", 0.0),
+                }
+            )
+        return self._platform.register_run_plan(
+            _require(body, "run_id"),
+            _require(body, "service_date"),
+            normalized,
+            allow_arrival_delay_s=_optional_float(body, "allow_arrival_delay_s"),
+            allow_departure_delay_s=_optional_float(body, "allow_departure_delay_s"),
+        )
+
+    def _punctuality_arrival(self, params: dict, body: dict) -> dict:
+        return self._platform.record_actual_arrival(
+            _require(body, "run_id"),
+            _require(body, "station_id"),
+            _optional_float(body, "at"),
+        )
+
+    def _punctuality_departure(self, params: dict, body: dict) -> dict:
+        return self._platform.record_actual_departure(
+            _require(body, "run_id"),
+            _require(body, "station_id"),
+            _optional_float(body, "at"),
         )
 
     def _reset_state(self, params: dict, body: dict) -> dict:

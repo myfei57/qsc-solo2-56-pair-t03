@@ -47,6 +47,12 @@
   "audit": {
     "journal_segment": 512
   },
+  "punctuality": {
+    "default_headway_s": 120.0,
+    "allow_arrival_delay_s": 120.0,
+    "allow_departure_delay_s": 120.0,
+    "journal_segment": 512
+  },
   "console": {
     "host": "127.0.0.1",
     "port": 8080

@@ -103,6 +103,16 @@ class AuditSection:
 
 
 @dataclass(frozen=True)
+class PunctualitySection:
+    """到发偏差与晚点传导限值。"""
+
+    default_headway_s: float = 120.0
+    allow_arrival_delay_s: float = 120.0
+    allow_departure_delay_s: float = 120.0
+    journal_segment: int = 512
+
+
+@dataclass(frozen=True)
 class ConsoleSection:
     """控制台监听地址。"""
 
@@ -124,6 +134,7 @@ class PlatformConfig:
     interlock: InterlockSection = field(default_factory=InterlockSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
+    punctuality: PunctualitySection = field(default_factory=PunctualitySection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
 
     @property
@@ -169,6 +180,14 @@ class PlatformConfig:
             raise ConfigError("运行配额必须为正", component="config")
         if self.audit.journal_segment <= 0:
             raise ConfigError("审计分段长度必须为正", component="config")
+        if self.punctuality.default_headway_s < 0:
+            raise ConfigError("默认追踪间隔不能为负", component="config")
+        if self.punctuality.allow_arrival_delay_s < 0:
+            raise ConfigError("到站允许晚点不能为负", component="config")
+        if self.punctuality.allow_departure_delay_s < 0:
+            raise ConfigError("发车允许晚点不能为负", component="config")
+        if self.punctuality.journal_segment <= 0:
+            raise ConfigError("到发偏差流水分段长度必须为正", component="config")
         if not 0 < self.console.port <= 65535:
             raise ConfigError("控制台端口必须落在 1..65535", component="config")
         return self
@@ -213,6 +232,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "interlock": dict(config.interlock.__dict__),
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
+        "punctuality": dict(config.punctuality.__dict__),
         "console": dict(config.console.__dict__),
     }
 
@@ -233,6 +253,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         interlock=_section(InterlockSection, payload.get("interlock")),
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
+        punctuality=_section(PunctualitySection, payload.get("punctuality")),
         console=_section(ConsoleSection, payload.get("console")),
     )
     return config.validate()

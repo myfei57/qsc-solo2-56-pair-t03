@@ -45,6 +45,7 @@ from .interlock import (
 from .ns import Namespace, NamespaceRegistry
 from .platform import MappingRegistry, adjacent, group_keys, physical_groups, resolve
 from .psd import LockoutRegistry, PSD, PSDRegistry, sweep_station
+from .punctuality import PlannedCall, PunctualityService
 from .quota import QuotaRegistry
 from .sig import SignalController, aspect_of, depart_checked, refresh_position, signal_summary
 from .station import (
@@ -140,6 +141,19 @@ class Platform:
         self.bus.subscribe("*", self._on_event)
         self._register_namespaces()
         self._seed(store)
+        self.punctuality = PunctualityService(
+            JsonlJournal(
+                store.root,
+                "punctuality",
+                segment_limit=self.config.punctuality.journal_segment,
+            ),
+            self.clock,
+            self.namespace.station_ids(),
+            self._schedule_headways(),
+            default_arrival_tolerance_s=self.config.punctuality.allow_arrival_delay_s,
+            default_departure_tolerance_s=self.config.punctuality.allow_departure_delay_s,
+            default_headway_s=self.config.punctuality.default_headway_s,
+        )
         self._restore()
 
     def _on_event(self, event: Event) -> None:
@@ -405,6 +419,10 @@ class Platform:
             }
         )
         try:
+            deviation = self._record_live_arrival(train_id, station_id, steps)
+        except RailError as error:
+            return reject(error.message)
+        try:
             self.doors_open(train_id, station_id)
         except RailError as error:
             return reject(error.message)
@@ -414,6 +432,7 @@ class Platform:
             "train_id": train_id,
             "station_id": station_id,
             "position_m": alignment.position_m,
+            "punctuality": deviation.as_dict() if hasattr(deviation, "as_dict") else None,
             "steps": steps,
             "violations": [],
         }
@@ -490,6 +509,30 @@ class Platform:
                 "detail": {"train_id": train_id, "state": gap_state},
             }
         )
+        decision = self._departure_punctuality(train_id, station_id)
+        if decision is not None and not decision["ok"]:
+            report = {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": station_id,
+                "steps": steps,
+                "punctuality": decision,
+                "violations": list(decision["violations"]),
+            }
+            summary = self._record_operation(op_id, "depart", report)
+            return {**report, **summary}
+        if decision is not None:
+            steps.append(
+                {
+                    "component": "punctuality",
+                    "action": "release",
+                    "detail": {
+                        "run_id": decision["run_id"],
+                        "wait_s": decision["wait_s"],
+                        "effective_delay_s": decision["effective_departure_delay_s"],
+                    },
+                }
+            )
         verdict = depart_checked(self.signals, self.store, self.gaps, train_id, self.clock.now())
         if not verdict["ok"]:
             report = {
@@ -504,6 +547,22 @@ class Platform:
         steps.append(
             {"component": "sig", "action": "depart_signal", "detail": {"train_id": train_id}}
         )
+        if decision is not None:
+            deviation = self.punctuality.record_departure(
+                decision["run_id"], station_id, self.clock.now()
+            )
+            self.audit.record(
+                "punctuality_actual_departure",
+                train_id,
+                station_id,
+                run_id=decision["run_id"],
+                at=self.clock.now(),
+                delay_s=deviation.departure_delay_s,
+                effective_delay_s=deviation.effective_departure_delay_s,
+                breach=deviation.departure_breach,
+            )
+        else:
+            deviation = None
         departure = depart(self.doors, train_id, self.clock.now())
         if gate is not None:
             self.lockouts.clear(gate.id)
@@ -514,6 +573,7 @@ class Platform:
             "close_durable": bool(closed["close_durable"]),
             "aspect": verdict["aspect"],
             "cleared_commands": departure["cleared_commands"],
+            "punctuality": deviation.as_dict() if deviation else None,
             "steps": steps,
             "violations": [],
         }
@@ -666,6 +726,142 @@ class Platform:
         )
         return {"ok": True, "route": route.__dict__, "violations": []}
 
+    # ---- 到发偏差 -----------------------------------------------------
+
+    def register_run_plan(
+        self,
+        run_id: str,
+        service_date: str,
+        calls: list[dict],
+        *,
+        allow_arrival_delay_s: float | None = None,
+        allow_departure_delay_s: float | None = None,
+    ) -> dict:
+        """登记一个班次的车次计划，供排班、放行和审计共用。"""
+
+        planned = tuple(PlannedCall.from_dict(call) for call in calls)
+        plan = self.punctuality.register_plan(
+            run_id,
+            service_date,
+            planned,
+            allow_arrival_delay_s=allow_arrival_delay_s,
+            allow_departure_delay_s=allow_departure_delay_s,
+        )
+        self.audit.record(
+            "punctuality_plan_registered",
+            run_id,
+            "",
+            service_date=service_date,
+            revision=plan.revision,
+            calls=len(plan.calls),
+            allow_arrival_delay_s=allow_arrival_delay_s,
+            allow_departure_delay_s=allow_departure_delay_s,
+        )
+        return {"ok": True, **self.punctuality.run_view(run_id), "violations": []}
+
+    def record_actual_arrival(
+        self, run_id: str, station_id: str, at: float | None = None
+    ) -> dict:
+        """人工补录或外部系统登记实际到站。"""
+
+        observed = self.clock.now() if at is None else at
+        deviation = self.punctuality.record_arrival(run_id, station_id, observed)
+        self.audit.record(
+            "punctuality_actual_arrival",
+            run_id,
+            station_id,
+            at=observed,
+            delay_s=deviation.arrival_delay_s,
+            effective_delay_s=deviation.effective_arrival_delay_s,
+            breach=deviation.arrival_breach,
+        )
+        return {"ok": True, "deviation": deviation.as_dict(), "violations": []}
+
+    def record_actual_departure(
+        self, run_id: str, station_id: str, at: float | None = None
+    ) -> dict:
+        """人工补录或外部系统登记实际发车（不走门控安全链）。"""
+
+        observed = self.clock.now() if at is None else at
+        deviation = self.punctuality.record_departure(run_id, station_id, observed)
+        self.audit.record(
+            "punctuality_actual_departure",
+            run_id,
+            station_id,
+            at=observed,
+            delay_s=deviation.departure_delay_s,
+            effective_delay_s=deviation.effective_departure_delay_s,
+            breach=deviation.departure_breach,
+        )
+        return {"ok": True, "deviation": deviation.as_dict(), "violations": []}
+
+    def punctuality_status(self, service_date: str = "") -> dict:
+        """读取偏差总览，排班、控制台与审计使用同一份投影。"""
+
+        return self.punctuality.status(service_date)
+
+    def punctuality_run_view(self, run_id: str) -> dict:
+        """读取一个车次的全部站台偏差。"""
+
+        return self.punctuality.run_view(run_id)
+
+    def punctuality_station_view(self, station_id: str, service_date: str = "") -> dict:
+        """读取一个站台的全部车次偏差。"""
+
+        return self.punctuality.station_view(station_id, service_date)
+
+    def replay_punctuality(self, as_of_seq: int, service_date: str = "") -> dict:
+        """按事件前缀重放历史班次，不写任何新事件或审计。"""
+
+        return self.punctuality.replay(as_of_seq, service_date)
+
+    def _record_live_arrival(self, train_id: str, station_id: str, steps: list[dict]):
+        """现场到站自动落账；没有唯一计划时不影响旧的门控流程。"""
+
+        call = self.punctuality.find_live_arrival(train_id, self.clock.now())
+        if call is None or call.station_id != station_id:
+            return None
+        deviation = self.punctuality.record_arrival(call.run_id, station_id, self.clock.now())
+        steps.append(
+            {
+                "component": "punctuality",
+                "action": "actual_arrival",
+                "detail": {
+                    "run_id": deviation.run_id,
+                    "arrival_delay_s": deviation.arrival_delay_s,
+                    "effective_delay_s": deviation.effective_arrival_delay_s,
+                },
+            }
+        )
+        self.audit.record(
+            "punctuality_actual_arrival",
+            train_id,
+            station_id,
+            run_id=deviation.run_id,
+            at=self.clock.now(),
+            delay_s=deviation.arrival_delay_s,
+            effective_delay_s=deviation.effective_arrival_delay_s,
+            breach=deviation.arrival_breach,
+        )
+        return deviation
+
+    def _departure_punctuality(self, train_id: str, station_id: str):
+        call = self.punctuality.find_live_departure(train_id, station_id, self.clock.now())
+        if call is None:
+            return None
+        decision = self.punctuality.depart_decision(call.run_id, station_id, self.clock.now())
+        self.audit.record(
+            "punctuality_departure_decision",
+            train_id,
+            station_id,
+            run_id=call.run_id,
+            allowed=decision["ok"],
+            reason=decision["reason"],
+            wait_s=decision["wait_s"],
+            violations=";".join(decision["violations"]),
+        )
+        return decision
+
     # ---- 控制循环 -----------------------------------------------------
 
     def cycle(self, dt: float = 1.0) -> dict:
@@ -746,6 +942,7 @@ class Platform:
                 ARRIVAL: self.quotas.status(ARRIVAL),
                 DEPART: self.quotas.status(DEPART),
             },
+            "punctuality": self.punctuality.status(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
             "trend": self.trend.snapshot(limit=4),
@@ -785,6 +982,7 @@ class Platform:
             "doors": door_state(self.doors, train_id),
             "aspect": aspect_of(self.signals, train_id),
             "gap": self.gaps.state(train_id),
+            "punctuality": self.punctuality.run_view(train_id),
         }
 
     def station_view(self, station_id: str) -> dict:
@@ -808,6 +1006,7 @@ class Platform:
             "groups": group_keys(self.mappings, station_id),
             "active_group": active_group(self.doors, station_id),
             "pressure": open_pressure(self.doors, station_id),
+            "punctuality": self.punctuality.station_view(station_id),
         }
 
     def resolve_group(self, station_id: str, group_key: str) -> dict:
@@ -842,6 +1041,16 @@ class Platform:
         return self.store.remove("platform/state")
 
     # ---- 内部 ---------------------------------------------------------
+
+    def _schedule_headways(self) -> dict[str, float]:
+        """读取排班的最短追踪间隔，作为偏差投影的同站台传导参数。"""
+
+        headways: dict[str, float] = {}
+        for station_id in self.namespace.station_ids():
+            schedule = self.schedules.get(station_id)
+            if schedule is not None:
+                headways[station_id] = float(min(schedule.headways))
+        return headways
 
     def _stop_position(self, station_id: str) -> int:
         """返回站台的停稳位置（取最近门区里程）。"""

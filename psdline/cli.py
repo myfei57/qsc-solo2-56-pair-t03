@@ -70,6 +70,18 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     platform = build_platform(config, clock=clock, storage_root=storage_root)
 
     startup = platform.start()
+    service_date = time.strftime("%Y-%m-%d", time.gmtime(clock.now()))
+    plan = platform.register_run_plan(
+        args.train,
+        service_date,
+        [
+            {
+                "station_id": args.station,
+                "arrival_at": clock.now(),
+                "departure_at": clock.now(),
+            }
+        ],
+    )
     arrival = platform.arrive(args.train, args.station, 0)
     position = platform.refresh_position(args.train, 12)
     gap = platform.check_gap(args.train)
@@ -96,6 +108,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     report = {
         "storage_root": storage_root,
         "startup": startup,
+        "punctuality_plan": {"ok": plan["ok"], "revision": plan["plan"]["revision"]},
         "arrival": {key: arrival[key] for key in ("ok", "position_m", "violations")},
         "position": position,
         "gap": gap,

@@ -80,6 +80,19 @@ def _station_page(platform: Platform) -> str:
         [(item["station"]["id"], f"修订 {item['revision']} 跨度 {item['span_m']} m") for item in views]
         or [("暂无", "-")],
     )
+    body += _table(
+        "到发偏差",
+        [
+            (
+                item["station_id"],
+                f"停站 {item['summary']['calls']} 到站超限 {item['summary']['arrival_breaches']} "
+                f"间隔违章 {item['summary']['headway_breaches']} 最大有效到站晚点 "
+                f"{item['summary']['max_effective_arrival_delay_s']:.0f}s",
+            )
+            for item in (view["punctuality"] for view in views)
+        ]
+        or [("暂无", "-")],
+    )
     return _shell("站台控制台", body)
 
 
@@ -119,6 +132,21 @@ def _train_page(platform: Platform) -> str:
                 f"排队 {item['doors']['queued']} 条 发车 {'是' if item['doors']['departed'] else '否'}",
             )
             for item in views
+        ]
+        or [("暂无", "-")],
+    )
+    body += _table(
+        "到发偏差",
+        [
+            (
+                f"{item['train']['id']} {call['station_id']}",
+                f"到站偏差 {call['arrival_deviation_s'] if call['arrival_deviation_s'] is not None else '-'} "
+                f"有效发车晚点 {call['effective_departure_delay_s']:.0f}s "
+                f"{'限行' if call['release_blocked'] else call['status']}",
+            )
+            for item in views
+            if item["train"]
+            for call in item["punctuality"]["deviations"]
         ]
         or [("暂无", "-")],
     )
@@ -168,6 +196,7 @@ def _alarm_page(platform: Platform) -> str:
     status = platform.status()
     interlock = status["interlock"]
     audit = status["audit"]
+    punctuality = status["punctuality"]["summary"]
     body = _table(
         "联锁与故障",
         [
@@ -177,6 +206,17 @@ def _alarm_page(platform: Platform) -> str:
             ("可发车", "是" if interlock["can_release_depart"] else "否"),
             ("审计条数", audit["entries"]),
             ("审计分段", audit["segments"]),
+        ],
+    )
+    body += _table(
+        "到发偏差告警",
+        [
+            ("登记停站", punctuality["calls"]),
+            ("到站超限", punctuality["arrival_breaches"]),
+            ("预测到站超限", punctuality["forecast_arrival_breaches"]),
+            ("发车超限", punctuality["departure_breaches"]),
+            ("追踪间隔违章", punctuality["headway_breaches"]),
+            ("当前限行", punctuality["release_blocked"]),
         ],
     )
     body += _table(
