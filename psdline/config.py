@@ -96,6 +96,16 @@ class QuotaSection:
 
 
 @dataclass(frozen=True)
+class DeviationSection:
+    """到发偏差限值与默认追踪间隔。"""
+
+    allowed_arrival_s: float = 60.0
+    allowed_departure_s: float = 60.0
+    default_headway_s: float = 120.0
+    journal_segment: int = 512
+
+
+@dataclass(frozen=True)
 class AuditSection:
     """审计流水分段。"""
 
@@ -123,6 +133,7 @@ class PlatformConfig:
     signal: SignalSection = field(default_factory=SignalSection)
     interlock: InterlockSection = field(default_factory=InterlockSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
+    deviation: DeviationSection = field(default_factory=DeviationSection)
     audit: AuditSection = field(default_factory=AuditSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
 
@@ -169,6 +180,12 @@ class PlatformConfig:
             raise ConfigError("运行配额必须为正", component="config")
         if self.audit.journal_segment <= 0:
             raise ConfigError("审计分段长度必须为正", component="config")
+        if self.deviation.allowed_arrival_s < 0 or self.deviation.allowed_departure_s < 0:
+            raise ConfigError("允许到发偏差不能为负", component="config")
+        if self.deviation.default_headway_s <= 0:
+            raise ConfigError("默认追踪间隔必须为正", component="config")
+        if self.deviation.journal_segment <= 0:
+            raise ConfigError("偏差流水分段长度必须为正", component="config")
         if not 0 < self.console.port <= 65535:
             raise ConfigError("控制台端口必须落在 1..65535", component="config")
         return self
@@ -212,6 +229,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "signal": dict(config.signal.__dict__),
         "interlock": dict(config.interlock.__dict__),
         "quota": dict(config.quota.__dict__),
+        "deviation": dict(config.deviation.__dict__),
         "audit": dict(config.audit.__dict__),
         "console": dict(config.console.__dict__),
     }
@@ -232,6 +250,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         signal=_section(SignalSection, payload.get("signal")),
         interlock=_section(InterlockSection, payload.get("interlock")),
         quota=_section(QuotaSection, payload.get("quota")),
+        deviation=_section(DeviationSection, payload.get("deviation")),
         audit=_section(AuditSection, payload.get("audit")),
         console=_section(ConsoleSection, payload.get("console")),
     )

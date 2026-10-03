@@ -13,6 +13,7 @@ from __future__ import annotations
 from .audit import AuditLog, build_timeline
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config, with_storage_root
+from .deviation import DeviationEventStore, DeviationService, deviation_summary
 from .door import (
     DoorController,
     active_group,
@@ -109,6 +110,18 @@ class Platform:
         self.stations = StationRegistry(store)
         self.layouts = LayoutRegistry(store)
         self.schedules = ScheduleRegistry(store)
+        deviation_events = DeviationEventStore(
+            JsonlJournal(store.root, "deviation", segment_limit=self.config.deviation.journal_segment)
+        )
+        self.deviations = DeviationService(
+            self.clock,
+            deviation_events,
+            station_order=list(self.namespace.station_ids()),
+            allowed_arrival_s=self.config.deviation.allowed_arrival_s,
+            allowed_departure_s=self.config.deviation.allowed_departure_s,
+            default_headway_s=self.config.deviation.default_headway_s,
+            headway_provider=self._minimum_headway,
+        )
         self.trains = TrainRegistry(store)
         self.align = AlignRegistry(store, tolerance_m=self.config.station.stop_tolerance_m)
         self.train_doors = DoorStateRegistry(store)
@@ -160,6 +173,7 @@ class Platform:
             ("station", "door", "platform-door"),
             ("station", "interlock", "door-interlock"),
             ("station", "quota", "quota-counter"),
+            ("station", "deviation", "deviation-engine"),
             ("station", "audit", "audit-sink"),
         ):
             self.namespaces.register(area, device, kind)
@@ -207,6 +221,7 @@ class Platform:
             (DEPART, self.config.quota.depart_limit),
         ):
             self.quotas.set_limit(name, limit)
+        self._seed_deviations()
         store.write(
             seed_doc,
             {"line": self.namespace.line_id(), "stations": self.namespace.station_ids()},
@@ -220,6 +235,31 @@ class Platform:
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
         restore_lockouts(self.faults, self.gates, self.lockouts, not self.gaps.blocked_ids())
+
+    def _minimum_headway(self, station_id: str) -> float:
+        schedule = self.schedules.get(station_id)
+        if schedule is not None:
+            return float(min(schedule.headways))
+        return float(self.config.deviation.default_headway_s)
+
+    def _seed_deviations(self) -> None:
+        """写入一份基线班次，保证新装服务立即有排班/放行可读。"""
+
+        if self.deviations.view().stops:
+            return
+        start = self.clock.now()
+        station_ids = self.namespace.station_ids()
+        for train_index, offset in enumerate((0, 120)):
+            for index, station_id in enumerate(station_ids):
+                arrival = start + offset + index * 180.0
+                departure = arrival if index == 0 else arrival + 60.0
+                self.deviations.register_plan(
+                    train_id=f"T{train_index + 1:02d}",
+                    station_id=station_id,
+                    planned_arrival=arrival,
+                    planned_departure=departure,
+                    version="baseline",
+                )
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -405,6 +445,24 @@ class Platform:
             }
         )
         try:
+            self.deviations.register_actual_arrival(train_id, station_id, self.clock.now())
+            actual_event = "registered"
+        except RailError as error:
+            if error.message.endswith("没有计划到发"):
+                self.deviations.register_unplanned_actual_arrival(
+                    train_id, station_id, self.clock.now()
+                )
+                actual_event = "unscheduled"
+            else:
+                actual_event = error.message
+        steps.append(
+            {
+                "component": "deviation",
+                "action": "actual_arrival",
+                "detail": {"train_id": train_id, "result": actual_event},
+            }
+        )
+        try:
             self.doors_open(train_id, station_id)
         except RailError as error:
             return reject(error.message)
@@ -443,11 +501,47 @@ class Platform:
         )
         return {**report, "group": group}
 
-    def depart(self, train_id: str, station_id: str) -> dict:
-        """关门到发车：关门指令 → 间隙探测 → 关门落盘 → 发车信号。"""
+    def depart(self, train_id: str, station_id: str, acknowledge_delay: bool = False) -> dict:
+        """关门到发车：偏差放行 → 关门指令 → 间隙探测 → 关门落盘 → 发车信号。"""
 
         op_id = self.ids.labeled("depart")
         steps: list[dict] = []
+        release = self.deviations.release_decision(train_id, station_id, self.clock.now())
+        if not release["ok"] and acknowledge_delay:
+            violations = set(release["violations"])
+            if violations <= {"departure_deviation_exceeded", "arrival_headway_breach"}:
+                self.deviations.acknowledge_delay(train_id, station_id, reason="发车放行显式确认")
+                release = self.deviations.release_decision(train_id, station_id, self.clock.now())
+        steps.append(
+            {
+                "component": "deviation",
+                "action": "release_check",
+                "detail": {
+                    "train_id": train_id,
+                    "hold": release["hold"],
+                    "departure_deviation_s": release.get("departure_deviation_s", 0.0),
+                },
+            }
+        )
+        if not release["ok"]:
+            self.audit.record(
+                "departure_release_held",
+                train_id,
+                station_id,
+                violations=list(release["violations"]),
+                reasons=list(release["reasons"]),
+                hold_until=release.get("hold_until"),
+            )
+            report = {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": station_id,
+                "steps": steps,
+                "violations": list(release["reasons"]),
+                "release": release,
+            }
+            summary = self._record_operation(op_id, "depart", report)
+            return {**report, **summary}
         if not self.quotas.consume(DEPART):
             report = {
                 "ok": False,
@@ -505,6 +599,24 @@ class Platform:
             {"component": "sig", "action": "depart_signal", "detail": {"train_id": train_id}}
         )
         departure = depart(self.doors, train_id, self.clock.now())
+        try:
+            self.deviations.register_actual_departure(train_id, station_id, self.clock.now())
+            departure_event = "registered"
+        except RailError as error:
+            if error.message.endswith("尚未登记实际到站"):
+                self.deviations.register_unplanned_actual_departure(
+                    train_id, station_id, self.clock.now()
+                )
+                departure_event = "unscheduled"
+            else:
+                raise
+        steps.append(
+            {
+                "component": "deviation",
+                "action": "actual_departure",
+                "detail": {"train_id": train_id, "result": departure_event},
+            }
+        )
         if gate is not None:
             self.lockouts.clear(gate.id)
         report = {
@@ -513,6 +625,7 @@ class Platform:
             "station_id": station_id,
             "close_durable": bool(closed["close_durable"]),
             "aspect": verdict["aspect"],
+            "release": release,
             "cleared_commands": departure["cleared_commands"],
             "steps": steps,
             "violations": [],
@@ -666,6 +779,56 @@ class Platform:
         )
         return {"ok": True, "route": route.__dict__, "violations": []}
 
+    def register_deviation_plan(
+        self,
+        train_id: str,
+        station_id: str,
+        planned_arrival: float,
+        planned_departure: float,
+        *,
+        version: str = "",
+        headway_s: float | None = None,
+    ) -> dict:
+        """登记跨班次的计划到发。"""
+
+        self.namespace.require(station_id)
+        event = self.deviations.register_plan(
+            train_id,
+            station_id,
+            planned_arrival,
+            planned_departure,
+            version=version,
+            headway_s=headway_s,
+        )
+        self.audit.record(
+            "deviation_plan_registered",
+            train_id,
+            station_id,
+            version=str(event.payload.get("version", "")),
+            sequence=event.sequence,
+        )
+        return {"ok": True, "event": event.as_dict(), "violations": []}
+
+    def acknowledge_deviation(self, train_id: str, station_id: str, reason: str = "") -> dict:
+        """确认超允许偏差，作为发车放行的人工责任记录。"""
+
+        event = self.deviations.acknowledge_delay(train_id, station_id, reason=reason)
+        self.audit.record(
+            "deviation_delay_acknowledged",
+            train_id,
+            station_id,
+            version=str(event.payload.get("version", "")),
+            reason=reason,
+        )
+        return {"ok": True, "event": event.as_dict(), "violations": []}
+
+    def deviation_view(self, *, at: float | None = None, sequence: int | None = None) -> dict:
+        """读取当前或历史截断点的偏差视图；历史结果由事件流重算。"""
+
+        if at is not None or sequence is not None:
+            return self.deviations.replay(at=at, sequence=sequence).as_dict()
+        return self.deviations.view().as_dict()
+
     # ---- 控制循环 -----------------------------------------------------
 
     def cycle(self, dt: float = 1.0) -> dict:
@@ -679,10 +842,15 @@ class Platform:
             train.id for train in self.trains.list() if self.positions.stale(train.id, moment)
         ]
         interlock = interlock_status(self.faults, self.gates, self.config.interlock.max_locked_ratio)
+        deviation_view = self.deviations.view()
+        deviation_holds = {
+            stop.train_id for stop in deviation_view.stops if stop.release_hold
+        }
         holding = [
             train.id
             for train in self.trains.list()
-            if not self.armers.armed(train.id) and depart_policy(self.doors, train.id)["allowed"]
+            if (not self.armers.armed(train.id) and depart_policy(self.doors, train.id)["allowed"])
+            or train.id in deviation_holds
         ]
         self.trend.append("locked_count", moment, interlock["locked_count"])
         self.trend.append("queued_commands", moment, queued_total(self.doors))
@@ -695,7 +863,10 @@ class Platform:
             "stale_positions": stale,
             "locked_count": interlock["locked_count"],
             "can_release_depart": interlock["can_release_depart"],
+            "deviation_holds": sorted(deviation_holds),
+            "deviation": deviation_summary(deviation_view),
             "ready_trains": holding,
+            "holding_trains": holding,
             "gaps": gap_summary(self.gaps, [train.id for train in self.trains.list()]),
             "violations": [],
         }
@@ -746,6 +917,10 @@ class Platform:
                 ARRIVAL: self.quotas.status(ARRIVAL),
                 DEPART: self.quotas.status(DEPART),
             },
+            "deviation": {
+                **deviation_summary(self.deviations.view()),
+                "stops": [stop.as_dict() for stop in self.deviations.view().stops],
+            },
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
             "trend": self.trend.snapshot(limit=4),
@@ -773,6 +948,7 @@ class Platform:
                 for station_id in self.namespace.station_ids()
             },
             "adjacent": self._adjacent_sample(),
+            "deviation": self.deviation_view(),
             "timeline": build_timeline(self.audit.list(), limit=20),
         }
 
@@ -785,6 +961,11 @@ class Platform:
             "doors": door_state(self.doors, train_id),
             "aspect": aspect_of(self.signals, train_id),
             "gap": self.gaps.state(train_id),
+            "deviations": [
+                stop.as_dict()
+                for stop in self.deviations.view().stops
+                if stop.train_id == train_id
+            ],
         }
 
     def station_view(self, station_id: str) -> dict:
@@ -808,6 +989,9 @@ class Platform:
             "groups": group_keys(self.mappings, station_id),
             "active_group": active_group(self.doors, station_id),
             "pressure": open_pressure(self.doors, station_id),
+            "deviations": [
+                stop.as_dict() for stop in self.deviations.station_deviations(station_id)
+            ],
         }
 
     def resolve_group(self, station_id: str, group_key: str) -> dict:

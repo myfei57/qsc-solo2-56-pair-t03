@@ -44,6 +44,12 @@
     "arrival_limit": 1000,
     "depart_limit": 1000
   },
+  "deviation": {
+    "allowed_arrival_s": 60.0,
+    "allowed_departure_s": 60.0,
+    "default_headway_s": 120.0,
+    "journal_segment": 512
+  },
   "audit": {
     "journal_segment": 512
   },

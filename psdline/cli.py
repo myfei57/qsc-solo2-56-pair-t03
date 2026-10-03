@@ -70,7 +70,9 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     platform = build_platform(config, clock=clock, storage_root=storage_root)
 
     startup = platform.start()
+    clock.advance(30)
     arrival = platform.arrive(args.train, args.station, 0)
+    clock.advance(65)
     position = platform.refresh_position(args.train, 12)
     gap = platform.check_gap(args.train)
     queued = platform.enqueue(args.train, "cmd-1", "open", args.station)
@@ -83,7 +85,12 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     sequence = platform.sequence_verdict(65534, 4)
     dwell = platform.register_dwell(args.train, 45.0, args.station)
     route = platform.assign_route(args.train, args.station, _next_station(platform, args.station), 1200)
-    departure = platform.depart(args.train, args.station)
+    held_departure = platform.depart(args.train, args.station)
+    departure = (
+        platform.depart(args.train, args.station, acknowledge_delay=True)
+        if not held_departure.get("ok")
+        else held_departure
+    )
     cycles = [platform.cycle(dt=args.dt) for _ in range(args.cycles)]
     final_sweep = platform.sweep(args.station)
 
@@ -109,6 +116,10 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "sequence": sequence,
         "dwell": dwell,
         "route": route,
+        "held_departure": {
+            key: held_departure.get(key)
+            for key in ("ok", "violations", "release")
+        },
         "departure": departure,
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],

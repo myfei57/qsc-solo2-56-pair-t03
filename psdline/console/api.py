@@ -67,6 +67,8 @@ class Api:
         add("GET", "/api/interlock", lambda params, body: self._platform.status()["interlock"])
         add("GET", "/api/gaps", lambda params, body: self._platform.status()["gaps"])
         add("GET", "/api/quota", lambda params, body: self._platform.status()["quota"])
+        add("GET", "/api/deviation", self._deviation)
+        add("GET", "/api/deviation/{trainID}/{stationID}", self._deviation_stop)
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/trend", self._trend)
@@ -90,6 +92,9 @@ class Api:
         add("POST", "/api/sweep", self._sweep)
         add("POST", "/api/dwell", self._dwell)
         add("POST", "/api/route", self._route)
+        add("POST", "/api/deviation/plan", self._deviation_plan)
+        add("POST", "/api/deviation/acknowledge", self._deviation_acknowledge)
+        add("POST", "/api/deviation/replay", self._deviation_replay)
         add("POST", "/api/reset-state", self._reset_state)
 
     def routes(self) -> list[dict]:
@@ -195,7 +200,11 @@ class Api:
         )
 
     def _depart(self, params: dict, body: dict) -> dict:
-        return self._platform.depart(_require(body, "train_id"), _require(body, "station_id"))
+        return self._platform.depart(
+            _require(body, "train_id"),
+            _require(body, "station_id"),
+            bool(body.get("acknowledge_delay", False)),
+        )
 
     def _gap(self, params: dict, body: dict) -> dict:
         return self._platform.check_gap(_require(body, "train_id"), bool(body.get("clear", True)))
@@ -260,6 +269,50 @@ class Api:
             _require(body, "origin"),
             _require(body, "destination"),
             _as_int(body, "distance_m", 0),
+        )
+
+    def _deviation(self, params: dict, body: dict) -> dict:
+        at = params.get("at")
+        sequence = params.get("sequence")
+        return self._platform.deviation_view(
+            at=None if at is None else float(at),
+            sequence=None if sequence is None else int(sequence),
+        )
+
+    def _deviation_stop(self, params: dict, body: dict) -> dict:
+        train_id = str(params.get("trainID", ""))
+        station_id = str(params.get("stationID", ""))
+        stop = self._platform.deviations.stop_deviation(train_id, station_id)
+        if stop is None:
+            raise RailError(f"{train_id}@{station_id} 没有偏差记录", component="console")
+        return {"deviation": stop.as_dict()}
+
+    def _deviation_plan(self, params: dict, body: dict) -> dict:
+        headway = body.get("headway_s")
+        return self._platform.register_deviation_plan(
+            _require(body, "train_id"),
+            _require(body, "station_id"),
+            _as_float(body, "planned_arrival", 0.0),
+            _as_float(body, "planned_departure", 0.0),
+            version=str(body.get("version", "")),
+            headway_s=None if headway is None else float(headway),
+        )
+
+    def _deviation_acknowledge(self, params: dict, body: dict) -> dict:
+        return self._platform.acknowledge_deviation(
+            _require(body, "train_id"),
+            _require(body, "station_id"),
+            str(body.get("reason", "")),
+        )
+
+    def _deviation_replay(self, params: dict, body: dict) -> dict:
+        at = body.get("at")
+        sequence = body.get("sequence")
+        if at is None and sequence is None:
+            raise RailError("重放必须提供 at 或 sequence", component="console")
+        return self._platform.deviation_view(
+            at=None if at is None else float(at),
+            sequence=None if sequence is None else int(sequence),
         )
 
     def _reset_state(self, params: dict, body: dict) -> dict:

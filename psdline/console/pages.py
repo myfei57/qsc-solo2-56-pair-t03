@@ -80,6 +80,17 @@ def _station_page(platform: Platform) -> str:
         [(item["station"]["id"], f"修订 {item['revision']} 跨度 {item['span_m']} m") for item in views]
         or [("暂无", "-")],
     )
+    deviation = status["deviation"]
+    body += _table(
+        "到发偏差",
+        [
+            ("活动班次", deviation["active_version"] or "-"),
+            ("晚点到站", deviation["late_arrivals"]),
+            ("晚点发车", deviation["late_departures"]),
+            ("放行扣留", deviation["departure_holds"]),
+            ("追踪间隔冲突", deviation["headway_breaches"]),
+        ],
+    )
     return _shell("站台控制台", body)
 
 
@@ -119,6 +130,19 @@ def _train_page(platform: Platform) -> str:
                 f"排队 {item['doors']['queued']} 条 发车 {'是' if item['doors']['departed'] else '否'}",
             )
             for item in views
+        ]
+        or [("暂无", "-")],
+    )
+    body += _table(
+        "到发偏差",
+        [
+            (
+                f"{item['state']['train_id']}@{stop['station_id']}",
+                f"到站 {stop['arrival_deviation_s']:.0f}s 发车 {stop['departure_deviation_s']:.0f}s "
+                f"{'扣留' if stop['release_hold'] else '可放行'}",
+            )
+            for item in views
+            for stop in item["deviations"]
         ]
         or [("暂无", "-")],
     )
@@ -168,6 +192,7 @@ def _alarm_page(platform: Platform) -> str:
     status = platform.status()
     interlock = status["interlock"]
     audit = status["audit"]
+    deviation = status["deviation"]
     body = _table(
         "联锁与故障",
         [
@@ -175,6 +200,8 @@ def _alarm_page(platform: Platform) -> str:
             ("锁定门数", interlock["locked_count"]),
             ("锁定比例", interlock["locked_ratio"]),
             ("可发车", "是" if interlock["can_release_depart"] else "否"),
+            ("偏差放行扣留", deviation["departure_holds"]),
+            ("追踪间隔冲突", deviation["headway_breaches"]),
             ("审计条数", audit["entries"]),
             ("审计分段", audit["segments"]),
         ],

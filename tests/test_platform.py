@@ -17,7 +17,11 @@ def test_start_reports_ready(platform):
 def test_arrive_then_depart_full_chain(platform):
     arrival = platform.arrive("T01", "ST1", 0)
     assert arrival["ok"] is True
-    assert [step["action"] for step in arrival["steps"]] == ["arrival_signal", "align"]
+    assert [step["action"] for step in arrival["steps"]] == [
+        "arrival_signal",
+        "align",
+        "actual_arrival",
+    ]
     assert platform.align.durable("T01") is True
     assert platform.train_doors.is_open("T01") is True
     gap = platform.check_gap("T01")
